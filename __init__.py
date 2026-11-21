@@ -224,16 +224,21 @@ def _stamp_clock(session_store: Any, session_key: str,
                  expected_session_id: Optional[str], value: str) -> bool:
     """Worker-thread body for the user-activity clock advance.
 
-    Runs off the event loop because ``set_session_metadata`` rewrites routing
-    state synchronously (and, in today's engine, holds the store lock across
-    that write). It also must not stamp the wrong session: the route is read
-    off the loop, so a reset can replace it before the write lands.
+    Runs off the event loop because the engine's save is synchronous. It also
+    must not stamp the wrong session: the route is read off the loop, so a
+    reset can replace it before the write lands.
 
-    The engine's ``_update_entry(session_key, mutate)`` runs ``mutate`` under
-    the store lock and persists only when it returns True, so the identity
-    check and the write are atomic. Stores without that seam fall back to a
-    separate peek (best effort). Returns True only when the clock advanced.
+    ``set_session_metadata_if`` is the engine's fast seam: under the store lock
+    it checks the route's identity and persists ONE routing row, never the
+    whole index whose rewrite held the loop past Discord's heartbeat. Engines
+    without it get ``_update_entry`` (atomic, but a whole-index rewrite) and
+    then a separate peek (best effort). Returns True only when the clock
+    advanced.
     """
+    setter = getattr(session_store, "set_session_metadata_if", None)
+    if callable(setter):
+        return bool(setter(session_key, _META_KEY, value, expected_session_id))
+
     def _apply(entry: Any) -> bool:
         if expected_session_id is not None and \
                 getattr(entry, "session_id", None) != expected_session_id:
