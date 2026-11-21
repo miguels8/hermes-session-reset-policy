@@ -16,9 +16,12 @@ Standalone-suite discipline (per the platform-plugin skill):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import os
 import sys
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -721,3 +724,333 @@ def test_policy_reader_resolves_profiles_from_root(plugin, tmp_path, monkeypatch
         assert policy == {"mode": "idle", "idle_minutes": minutes}, (
             f"HERMES_HOME={home} profile={profile!r} -> {policy}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Event-loop hygiene for the clock stamp
+#
+# Alert sig:system|bacda61e84: the gateway asyncio loop blocked past Discord's
+# 10 s heartbeat deadline because this async hook ran the within-threshold clock
+# save inline. set_session_metadata -> _update_entry -> _save() rewrites the
+# whole routing index in SQLite and the engine holds the store lock across it.
+# The write must run off the loop, and it must not land on a replacement route.
+# ---------------------------------------------------------------------------
+
+class _LockedStore:
+    """Models the engine's store: ``_update_entry`` holds the lock across the
+    full save and applies ``mutate`` under it; accessors need the same lock."""
+
+    def __init__(self, entry):
+        self._entry = entry
+        self._lock = threading.Lock()
+        self.stamp_delay = 0.4
+        self.stamps = []
+        self.used_update_entry = False
+
+    def lookup_by_session_key(self, key):
+        with self._lock:
+            return self._entry
+
+    def peek_session_id(self, key):
+        with self._lock:
+            return self._entry.session_id
+
+    def _update_entry(self, key, mutate):
+        self.used_update_entry = True
+        with self._lock:
+            time.sleep(self.stamp_delay)  # the synchronous full-index save
+            if mutate(self._entry) is False:
+                return False
+            self.stamps.append(dict(self._entry.metadata))
+            return True
+
+    def set_session_metadata(self, key, meta_key, value):
+        with self._lock:
+            time.sleep(self.stamp_delay)
+            self._entry.metadata[meta_key] = value
+            self.stamps.append(value)
+        return True
+
+
+def _entry_within_threshold():
+    return SimpleNamespace(
+        metadata={},
+        updated_at=datetime.now(),
+        created_at=datetime.now(),
+        active_turn_token=None,
+        session_id="seed-sid",
+    )
+
+
+def _replacement_entry():
+    return SimpleNamespace(
+        metadata={},
+        updated_at=datetime.now(),
+        created_at=datetime.now(),
+        active_turn_token=None,
+        session_id="rotated-sid",
+    )
+
+
+def _gateway():
+    return SimpleNamespace(_session_key_for_source=lambda src: "agent:main:local:dm:test-chat")
+
+
+def _scenario(plugin, store):
+    """Run the hook under a 10 ms ticker and count loop ticks it lets through."""
+    event = SimpleNamespace(source=SimpleNamespace(profile=None), internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+
+    async def run():
+        ticks = 0
+        done = False
+
+        async def ticker():
+            nonlocal ticks
+            while not done:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        task = asyncio.create_task(ticker())
+        try:
+            await asyncio.sleep(0.03)
+            base = ticks
+            with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+                await plugin._maybe_reset(event, _gateway(), store)
+            return ticks - base
+        finally:
+            done = True
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    return asyncio.run(run())
+
+
+def test_clock_stamp_does_not_block_the_event_loop(plugin):
+    store = _LockedStore(_entry_within_threshold())
+
+    ticks = _scenario(plugin, store)
+
+    assert store.stamps, "the clock stamp must still be persisted"
+    assert ticks >= 10, (
+        f"only {ticks} loop ticks during a ~0.4 s save; the clock stamp blocked "
+        "the event loop and can miss the Discord heartbeat"
+    )
+
+
+def test_clock_stamp_uses_the_atomic_store_seam(plugin):
+    """The identity check and the write must ride one store operation."""
+    store = _LockedStore(_entry_within_threshold())
+
+    _scenario(plugin, store)
+
+    assert store.used_update_entry is True, (
+        "the stamp bypassed _update_entry, so the route check and the write "
+        "are not atomic"
+    )
+    assert store.stamps, "the clock stamp must still be persisted"
+
+
+class _RotatesDuringWrite(_LockedStore):
+    """The route is replaced just before the save lands."""
+
+    def _update_entry(self, key, mutate):
+        self.used_update_entry = True
+        with self._lock:
+            self._entry = _replacement_entry()
+            time.sleep(self.stamp_delay)
+            if mutate(self._entry) is False:
+                return False
+            self.stamps.append(dict(self._entry.metadata))
+            return True
+
+
+def test_clock_stamp_skipped_when_route_rotates_mid_write(plugin):
+    """The BLOCKER: a reset between the read and the write must win."""
+    store = _RotatesDuringWrite(_entry_within_threshold())
+
+    _scenario(plugin, store)
+
+    assert store.stamps == [], (
+        "the clock stamp landed on the replacement session instead of being skipped"
+    )
+    assert store._entry.metadata.get(plugin._META_KEY) is None
+
+
+
+class _QueueGapStore(_LockedStore):
+    """Models the executor queue gap: the stamp is submitted but has not yet
+    taken the store lock, so an inline read still sees the old clock."""
+
+    def __init__(self, entry):
+        super().__init__(entry)
+        self.stamp_delay = 0
+        self.queued = threading.Event()
+        self.release = threading.Event()
+
+    def _update_entry(self, key, mutate):
+        self.used_update_entry = True
+        self.queued.set()
+        self.release.wait(timeout=5)  # queued, not yet applied
+        with self._lock:
+            if mutate(self._entry) is False:
+                return False
+            self.stamps.append(dict(self._entry.metadata))
+            return True
+
+
+class _FakeDateTime(datetime):
+    current = None
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.current
+
+
+def test_overlapping_messages_on_one_route_keep_their_order(plugin):
+    """BLOCKER (round 6): message 2 must not read the clock before message 1's
+    off-loop stamp lands, or a boundary crossed between them fires a reset that
+    the baseline never fired."""
+    # Patching the module's ``datetime`` shadows the isinstance() base class, so
+    # every timestamp this test produces is a _FakeDateTime.
+    base = _FakeDateTime(2026, 11, 21, 12, 0, 0)
+    entry = SimpleNamespace(metadata={}, updated_at=base, created_at=base,
+                            active_turn_token=None, session_id="seed-sid")
+    store = _QueueGapStore(entry)
+    funnel_calls = []
+
+    def funnel(_event):
+        funnel_calls.append(1)
+        return None
+
+    gateway = SimpleNamespace(
+        _session_key_for_source=lambda src: "route-1",
+        _handle_reset_command=funnel,
+    )
+    event = SimpleNamespace(source=SimpleNamespace(profile=None), internal=False)
+    policy = {"mode": "idle", "idle_minutes": 1}  # 60 s boundary
+
+    original_datetime = plugin.datetime
+    plugin.datetime = _FakeDateTime
+    _FakeDateTime.current = _FakeDateTime(2026, 11, 21, 12, 0, 30)
+    try:
+        async def run():
+            with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+                first = asyncio.create_task(plugin._maybe_reset(event, gateway, store))
+                await asyncio.to_thread(store.queued.wait, 5)  # first stamp is queued
+                _FakeDateTime.current = _FakeDateTime(2026, 11, 21, 12, 1, 1)  # boundary crossed
+                second = asyncio.create_task(plugin._maybe_reset(event, gateway, store))
+                await asyncio.sleep(0.05)
+                store.release.set()
+                await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+
+        asyncio.run(run())
+    finally:
+        plugin.datetime = original_datetime
+
+    assert funnel_calls == [], (
+        "the second message read a stale clock and reset a session the first "
+        "message had just stamped"
+    )
+    assert len(store.stamps) == 2, "both arrivals must still advance the clock"
+
+
+
+def test_cancelled_stamp_still_serializes_the_route(plugin):
+    """BLOCKER (round 7): cancelling the hook must not release the route lock
+    while the save is still in flight, or the next message reads a stale clock."""
+    base = _FakeDateTime(2026, 11, 21, 12, 0, 0)
+    entry = SimpleNamespace(metadata={}, updated_at=base, created_at=base,
+                            active_turn_token=None, session_id="seed-sid")
+    store = _QueueGapStore(entry)
+    funnel_calls = []
+
+    def funnel(_event):
+        funnel_calls.append(1)
+        return None
+
+    gateway = SimpleNamespace(
+        _session_key_for_source=lambda src: "route-1",
+        _handle_reset_command=funnel,
+    )
+    event = SimpleNamespace(source=SimpleNamespace(profile=None), internal=False)
+    policy = {"mode": "idle", "idle_minutes": 1}
+
+    original_datetime = plugin.datetime
+    plugin.datetime = _FakeDateTime
+    _FakeDateTime.current = _FakeDateTime(2026, 11, 21, 12, 0, 30)
+    try:
+        async def run():
+            with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+                first = asyncio.create_task(plugin._maybe_reset(event, gateway, store))
+                await asyncio.to_thread(store.queued.wait, 5)  # worker holds the write
+                first.cancel()
+                await asyncio.sleep(0)  # deliver the cancellation
+                _FakeDateTime.current = _FakeDateTime(2026, 11, 21, 12, 1, 1)
+                second = asyncio.create_task(plugin._maybe_reset(event, gateway, store))
+                await asyncio.sleep(0.05)
+                store.release.set()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(first, timeout=10)
+                await asyncio.wait_for(second, timeout=10)
+
+        asyncio.run(run())
+    finally:
+        plugin.datetime = original_datetime
+
+    assert funnel_calls == [], (
+        "a cancelled hook released the route lock mid-save, so the next message "
+        "read a stale clock and reset the session"
+    )
+    assert len(store.stamps) == 2, "both arrivals must still advance the clock"
+
+
+
+class _FailingSaveStore(_QueueGapStore):
+    """The queued save raises after the hook is cancelled."""
+
+    def _update_entry(self, key, mutate):
+        self.queued.set()
+        self.release.wait(timeout=5)
+        raise OSError("state.db is gone")
+
+
+def test_failed_save_during_cancellation_keeps_the_cancellation(plugin):
+    """BLOCKER (round 8): a save error must not replace CancelledError, or the
+    gateway treats it as a plugin failure and keeps dispatching."""
+    base = _FakeDateTime(2026, 11, 21, 12, 0, 0)
+    entry = SimpleNamespace(metadata={}, updated_at=base, created_at=base,
+                            active_turn_token=None, session_id="seed-sid")
+    store = _FailingSaveStore(entry)
+
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: "route-1")
+    event = SimpleNamespace(source=SimpleNamespace(profile=None), internal=False)
+    policy = {"mode": "idle", "idle_minutes": 1}
+
+    original_datetime = plugin.datetime
+    plugin.datetime = _FakeDateTime
+    _FakeDateTime.current = _FakeDateTime(2026, 11, 21, 12, 0, 30)
+    try:
+        async def run():
+            with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+                hook = asyncio.create_task(plugin._maybe_reset(event, gateway, store))
+                await asyncio.to_thread(store.queued.wait, 5)
+                hook.cancel()
+                await asyncio.sleep(0)
+                store.release.set()
+                await asyncio.wait_for(hook, timeout=10)
+
+        raised = None
+        try:
+            asyncio.run(run())
+        except BaseException as exc:  # noqa: BLE001 - we assert on the type below
+            raised = exc
+        assert isinstance(raised, asyncio.CancelledError), (
+            f"expected CancelledError, got {raised!r}; a failed save must not "
+            "replace the cancellation"
+        )
+    finally:
+        plugin.datetime = original_datetime

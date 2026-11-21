@@ -87,6 +87,7 @@ Compatibility notes
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import inspect
@@ -219,6 +220,45 @@ def _lookup_entry(session_store: Any, session_key: Optional[str]) -> Any:
         return None
 
 
+def _stamp_clock(session_store: Any, session_key: str,
+                 expected_session_id: Optional[str], value: str) -> bool:
+    """Worker-thread body for the user-activity clock advance.
+
+    Runs off the event loop because ``set_session_metadata`` rewrites routing
+    state synchronously (and, in today's engine, holds the store lock across
+    that write). It also must not stamp the wrong session: the route is read
+    off the loop, so a reset can replace it before the write lands.
+
+    The engine's ``_update_entry(session_key, mutate)`` runs ``mutate`` under
+    the store lock and persists only when it returns True, so the identity
+    check and the write are atomic. Stores without that seam fall back to a
+    separate peek (best effort). Returns True only when the clock advanced.
+    """
+    def _apply(entry: Any) -> bool:
+        if expected_session_id is not None and \
+                getattr(entry, "session_id", None) != expected_session_id:
+            logger.debug(
+                "session-reset-policy: route %s rotated while the clock stamp "
+                "waited; not stamping the replacement", session_key,
+            )
+            return False
+        entry.metadata[_META_KEY] = value
+        return True
+
+    updater = getattr(session_store, "_update_entry", None)
+    if callable(updater):
+        return bool(updater(session_key, _apply))
+    if expected_session_id is not None:
+        try:
+            current = session_store.peek_session_id(session_key)
+        except Exception:
+            current = None
+        if current is not None and current != expected_session_id:
+            return False
+    session_store.set_session_metadata(session_key, _META_KEY, value)
+    return True
+
+
 def _resolve_session_key(gateway: Any, source: Any, from_payload: Optional[str]) -> Optional[str]:
     """The routing key for *source*: the hook payload's ``session_key`` when a
     future Hermes exposes one publicly, else ``gateway._session_key_for_source``.
@@ -330,6 +370,25 @@ async def _reset_session(gateway: Any, event: Any, source: Any, session_store: A
     return _reset_via_store(source, session_store, session_key)
 
 
+_ROUTE_LOCKS: Dict[str, "asyncio.Lock"] = {}
+
+
+def _route_lock_for(session_key: str) -> "asyncio.Lock":
+    """Serialize this hook per route.
+
+    The clock save runs off the loop, so without this a second message on the
+    same route could read the clock before the first message's save lands and
+    see a stale boundary. Holding one lock from the read through the save
+    restores the baseline's per-route ordering while keeping the loop free.
+    The map keeps one lock per session key the process has seen.
+    """
+    lock = _ROUTE_LOCKS.get(session_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ROUTE_LOCKS[session_key] = lock
+    return lock
+
+
 async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
                        session_key: Optional[str] = None, **_extra: Any) -> Optional[Dict[str, str]]:
     """pre_gateway_dispatch body: reset the session when the policy says so.
@@ -349,17 +408,54 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
     if not policy:
         return None
     key = _resolve_session_key(gateway, source, session_key)
+    if key is None:
+        return None
+    async with _route_lock_for(key):
+        return await _maybe_reset_locked(event, gateway, source, session_store, key, policy)
+
+
+async def _maybe_reset_locked(event: Any, gateway: Any, source: Any,
+                              session_store: Any, key: str,
+                              policy: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """The route-locked body of :func:`_maybe_reset`."""
     entry = _lookup_entry(session_store, key)
-    if key is None or entry is None:
-        return None  # no key or no route yet -> brand-new conversation anyway
+    if entry is None:
+        return None  # no route yet -> brand-new conversation anyway
 
     now = datetime.now()
     reason = _time_reset_reason(policy, _last_user_inbound(entry), now)
     if reason is None:
         # Not past the boundary: this message IS the user activity — advance
         # our own clock (never ``updated_at``; see module docstring).
+        # Off the loop: ``set_session_metadata`` serializes and rewrites the
+        # whole routing index synchronously, so under writer contention it can
+        # block for seconds. Run inline it starved the gateway heartbeat past
+        # Discord's 10 s deadline and forced a reconnect (sig:system|bacda61e84).
+        worker = asyncio.ensure_future(asyncio.to_thread(
+            _stamp_clock, session_store, key,
+            getattr(entry, "session_id", None), now.isoformat(),
+        ))
         try:
-            session_store.set_session_metadata(key, _META_KEY, now.isoformat())
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # The worker can still write. Let it land before this hook returns
+            # and releases the route lock, so the next message cannot read the
+            # old clock and fire a reset; then propagate the cancellation.
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    # A failed save must not replace the cancellation: log it
+                    # and let the cancellation win.
+                    logger.debug(
+                        "session_reset clock stamp failed during cancellation",
+                        exc_info=True)
+                    break
+            with contextlib.suppress(BaseException):
+                worker.exception()
+            raise
         except Exception:
             logger.debug("session_reset clock stamp failed", exc_info=True)
         return None
