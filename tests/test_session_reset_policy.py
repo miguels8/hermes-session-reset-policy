@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib.util
+import inspect
 import os
 import sys
 import threading
@@ -1286,3 +1287,81 @@ def test_failed_save_during_cancellation_keeps_the_cancellation(plugin):
         )
     finally:
         plugin.datetime = original_datetime
+
+
+# ---------------------------------------------------------------------------
+# Two routes, one store: a stamp on one route must not hold up another's lookup
+#
+# Finding (PR #1, __init__.py:247): moving the save to a worker is not enough
+# while the engine's stamp is a whole-index save under the store lock: the next
+# route's inline lookup (it runs on the gateway loop) waits for that lock. The
+# engine's identity-checked single-row setter never takes the whole-index path.
+# This test runs the real plugin over a real SessionStore, keeps the whole-index
+# writer busy behind a gate, and times the second route.
+# ---------------------------------------------------------------------------
+
+# Set to 1 only for an install made BEFORE the engine's single-row setter is
+# live (job oc-fix-engine-recarry-20261122): the test then reports xfail with the
+# reason instead of failing. Unset, an engine without the setter fails the suite.
+ENGINE_FASTPATH_PENDING_ENV = "SRP_ENGINE_FASTPATH_PENDING"
+
+
+def _engine_has_one_row_setter() -> bool:
+    mod = _import_tree_module("gateway.session")
+    return "expected_session_id" in inspect.signature(
+        mod.SessionStore.set_session_metadata).parameters
+
+
+def test_a_stamp_on_one_route_never_holds_up_another_routes_lookup(plugin, tmp_path):
+    store = _make_real_store(tmp_path)
+    key_a, _entry_a = _seed_route(store, chat_id="route-a")
+    key_b, _entry_b = _seed_route(store, chat_id="route-b")
+    if not _engine_has_one_row_setter() and os.environ.get(ENGINE_FASTPATH_PENDING_ENV) == "1":
+        pytest.xfail("engine has no identity-checked single-row setter yet "
+                     "(carried by job oc-fix-engine-recarry-20261122)")
+
+    busy_for = 1.0                  # how long the whole-index writer stays busy
+    release = threading.Event()     # the gate: the writer finishes when this opens
+    whole_index_saves = []
+    real_save = store._save
+
+    def busy_save(*args, **kwargs):
+        whole_index_saves.append(key_a)
+        release.wait(timeout=busy_for)
+        return real_save(*args, **kwargs)
+
+    store._save = busy_save
+
+    policy = {"mode": "idle", "idle_minutes": 60}  # both routes are fresh: stamp path
+    events = {key: SimpleNamespace(source=SimpleNamespace(profile=None), internal=False)
+              for key in (key_a, key_b)}
+
+    def hook(key):
+        gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+        return plugin._maybe_reset(events[key], gateway, store)
+
+    async def run():
+        with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+            first = asyncio.create_task(hook(key_a))
+            await asyncio.sleep(0.15)  # route A's stamp is now inside the engine write
+            started = time.perf_counter()
+            await hook(key_b)          # inline lookup, on the loop
+            elapsed = time.perf_counter() - started
+            release.set()
+            await first
+            return elapsed
+
+    elapsed = asyncio.run(run())
+
+    assert elapsed < busy_for / 2, (
+        f"route B's lookup waited {elapsed:.3f} s behind route A's whole-index "
+        "save: the stamp still holds the store lock the gateway loop needs. The "
+        "engine must carry the identity-checked single-row setter "
+        "(job oc-fix-engine-recarry-20261122)"
+    )
+    assert whole_index_saves == [], (
+        "the stamp rewrote the whole routing index; the engine has no "
+        "identity-checked single-row setter for the plugin to use"
+    )
+    assert store.get_session_metadata(key_a, plugin._META_KEY) is not None
+    assert store.get_session_metadata(key_b, plugin._META_KEY) is not None
