@@ -937,6 +937,57 @@ def test_stamp_falls_back_to_update_entry_on_an_older_engine(plugin):
     assert store.stamps and store.stamps[0][plugin._META_KEY] == "t1"
 
 
+class _UnguardedSetterStore:
+    """A store with a public metadata setter that cannot check the route.
+
+    ``set_session_metadata(key, meta_key, value)`` names the route by its key
+    only: nothing makes the identity check and the write one step, so a route
+    that rotated first would take the stamp.
+    """
+
+    def __init__(self, entry):
+        self._entry = entry
+        self.writes = []
+
+    def lookup_by_session_key(self, key):
+        return self._entry
+
+    def set_session_metadata(self, key, meta_key, value):
+        self._entry.metadata[meta_key] = value
+        self.writes.append((key, meta_key, value))
+        return True
+
+
+def test_a_setter_without_the_route_guard_never_stamps_a_replacement(plugin):
+    """Finding (PR #2, __init__.py:319): the route already rotated, the stamp
+    still carries the old session id, and the store's setter has no way to
+    refuse it. The durable write is skipped: the old conversation's activity
+    must not land on the replacement and move its idle clock."""
+    store = _UnguardedSetterStore(_replacement_entry())  # route rotated first
+
+    key = "route-rotated"
+    assert plugin._stamp_clock(store, key, "seed-sid", "2026-11-21T07:31:18") is False
+
+    assert store.writes == [], "the old route's stamp was written through an unguarded setter"
+    assert store._entry.metadata == {}, "the replacement route's clock was altered"
+    # The process-local clock still advances, bound to the id it saw, so the
+    # hook's idle decision for the live conversation is unharmed.
+    assert plugin._local_clock(key, "seed-sid") is not None
+    assert plugin._local_clock(key, "rotated-sid") is None
+
+
+def test_a_setter_without_the_route_guard_keeps_the_local_clock_for_a_live_route(plugin):
+    """Skipping the durable write must not stall the user-activity clock."""
+    store = _UnguardedSetterStore(_entry_within_threshold())
+    key = "route-live"
+
+    assert plugin._stamp_clock(store, key, "seed-sid", "2026-11-21T07:31:18") is False
+
+    assert store.writes == []
+    read = plugin._last_user_inbound(store._entry, key)
+    assert read is not None and read.isoformat() == "2026-11-21T07:31:18"
+
+
 class _RotatesDuringWrite(_LockedStore):
     """The route is replaced just before the stamp takes the store lock."""
 

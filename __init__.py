@@ -316,6 +316,17 @@ def _stamp_clock(session_store: Any, session_key: str,
         updater = getattr(session_store, "_update_entry", None)
         if callable(updater):
             return bool(updater(session_key, _apply))
+        if expected_session_id is not None:
+            # A public setter that cannot check the route: the identity check
+            # and the write would be two steps, and a route that rotated in
+            # between would take the old conversation's stamp and move its
+            # idle clock. Keep the id-bound clock in this process (recorded
+            # above) and skip the durable write.
+            logger.debug(
+                "session-reset-policy: store for %s has no atomic route guard; "
+                "keeping the clock in this process only", session_key,
+            )
+            return False
         return bool(setter(session_key, _META_KEY, value))
 
     # A store without the session-metadata API: mutate through its seam.
