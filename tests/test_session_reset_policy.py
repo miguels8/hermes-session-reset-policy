@@ -1320,23 +1320,67 @@ def _xfail_while_the_engine_carry_is_pending() -> None:
                      "(carried by job oc-fix-engine-recarry-20261122)")
 
 
-def test_a_stamp_on_one_route_never_holds_up_another_routes_lookup(plugin, tmp_path):
+def _two_route_contention(plugin, tmp_path, monkeypatch, *, row_write_under_store_lock=False):
+    """Route A's stamp is parked INSIDE the engine's database write; route B's
+    hook runs meanwhile, under a ticker that measures the gateway loop's pauses.
+
+    The gate sits at the database boundary (``SessionDB._execute_write``), below
+    whatever lock the engine holds, so it models slow SQLite I/O wherever the
+    engine does it: a whole-index save under the store lock stalls route B's
+    inline lookup, a single-row write outside that lock does not. ``entered`` is
+    set by the writer itself, so route B only runs once A is really inside it.
+    ``row_write_under_store_lock`` is the negative control: the single-row write
+    is forced to run under the store lock, as a bad engine would do it.
+    """
     store = _make_real_store(tmp_path)
     key_a, _entry_a = _seed_route(store, chat_id="route-a")
     key_b, _entry_b = _seed_route(store, chat_id="route-b")
-    _xfail_while_the_engine_carry_is_pending()
 
-    busy_for = 1.0                  # how long the whole-index writer stays busy
+    busy_for = 1.0                  # the longest the parked write stays parked
+    entered = threading.Event()     # set by the writer once route A is inside it
     release = threading.Event()     # the gate: the writer finishes when this opens
+    claim = threading.Lock()
+    armed = threading.Event()
+    expired = []
     whole_index_saves = []
+
+    def park():
+        with claim:
+            mine = armed.is_set()
+            armed.clear()           # only the first write after arming is parked
+        if mine:
+            entered.set()
+            if not release.wait(timeout=busy_for):
+                expired.append(1)   # somebody waited out the whole gate
+
+    # The database boundary, where an engine with a SQLite routing table writes.
+    session_db = _import_tree_module("hermes_state").SessionDB
+    real_write = getattr(session_db, "_execute_write", None)
+    if real_write is not None:
+        def parked_write(db, *args, **kwargs):
+            park()
+            return real_write(db, *args, **kwargs)
+
+        monkeypatch.setattr(session_db, "_execute_write", parked_write)
+
+    # The whole-index save, parked too: an engine without a SQLite routing table
+    # (or one that falls back to the full rewrite) writes there, under its lock.
     real_save = store._save
 
-    def busy_save(*args, **kwargs):
-        whole_index_saves.append(key_a)
-        release.wait(timeout=busy_for)
+    def counted_save(*args, **kwargs):
+        whole_index_saves.append(1)
+        park()
         return real_save(*args, **kwargs)
 
-    store._save = busy_save
+    store._save = counted_save
+    if row_write_under_store_lock:
+        real_row = store._save_entry
+
+        def row_under_lock(*args, **kwargs):
+            with store._lock:
+                return real_row(*args, lock_held=True, **kwargs)
+
+        store._save_entry = row_under_lock
 
     policy = {"mode": "idle", "idle_minutes": 60}  # both routes are fresh: stamp path
     events = {key: SimpleNamespace(source=SimpleNamespace(profile=None), internal=False)
@@ -1347,30 +1391,70 @@ def test_a_stamp_on_one_route_never_holds_up_another_routes_lookup(plugin, tmp_p
         return plugin._maybe_reset(events[key], gateway, store)
 
     async def run():
+        ticks = []
+        running = True
+
+        async def ticker():
+            while running:
+                ticks.append(time.perf_counter())
+                await asyncio.sleep(0.01)
+
         with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+            armed.set()
             first = asyncio.create_task(hook(key_a))
-            await asyncio.sleep(0.15)  # route A's stamp is now inside the engine write
-            started = time.perf_counter()
-            await hook(key_b)          # inline lookup, on the loop
-            elapsed = time.perf_counter() - started
+            got_in = await asyncio.to_thread(entered.wait, 5)  # A is inside the write
+            watcher = asyncio.create_task(ticker())
+            await asyncio.sleep(0.05)
+            second = asyncio.create_task(hook(key_b))  # its lookup runs inline, on the loop
+            await asyncio.sleep(0.4)                   # the window with A parked
+            running = False
+            await watcher
             release.set()
+            await second
             await first
-            return elapsed
+            # The gateway loop's longest pause. Route B's OWN stamp may wait for the
+            # engine's write lock off the loop; only a stalled loop misses a heartbeat.
+            return got_in, max(b - a for a, b in zip(ticks, ticks[1:]))
 
-    elapsed = asyncio.run(run())
+    got_in, loop_gap = asyncio.run(run())
+    return SimpleNamespace(store=store, key_a=key_a, key_b=key_b, got_in=got_in,
+                           loop_gap=loop_gap, expired=expired, busy_for=busy_for,
+                           whole_index_saves=whole_index_saves)
 
-    assert elapsed < busy_for / 2, (
-        f"route B's lookup waited {elapsed:.3f} s behind route A's whole-index "
-        "save: the stamp still holds the store lock the gateway loop needs. The "
-        "engine must carry the identity-checked single-row setter "
-        "(job oc-fix-engine-recarry-20261122)"
+
+def test_a_stamp_on_one_route_never_holds_up_another_routes_lookup(plugin, tmp_path, monkeypatch):
+    _xfail_while_the_engine_carry_is_pending()
+
+    out = _two_route_contention(plugin, tmp_path, monkeypatch)
+
+    assert out.got_in, "route A's stamp never reached the database write"
+    assert out.loop_gap < out.busy_for / 4 and not out.expired, (
+        f"the gateway loop paused {out.loop_gap:.3f} s behind route A's stamp: route "
+        "B's inline lookup waited for the store lock the stamp holds. The engine must "
+        "carry the identity-checked single-row setter (job oc-fix-engine-recarry-20261122)"
     )
-    assert whole_index_saves == [], (
+    assert out.whole_index_saves == [], (
         "the stamp rewrote the whole routing index; the engine has no "
         "identity-checked single-row setter for the plugin to use"
     )
-    assert store.get_session_metadata(key_a, plugin._META_KEY) is not None
-    assert store.get_session_metadata(key_b, plugin._META_KEY) is not None
+    assert out.store.get_session_metadata(out.key_a, plugin._META_KEY) is not None
+    assert out.store.get_session_metadata(out.key_b, plugin._META_KEY) is not None
+
+
+def test_the_contention_test_notices_a_row_write_under_the_store_lock(plugin, tmp_path,
+                                                                      monkeypatch):
+    """Negative control: an engine that runs its single-row write under the store
+    lock stalls the loop, and the contention test above can see it. Needs the
+    engine's single-row path, whose write this control wraps."""
+    _xfail_while_the_engine_carry_is_pending()
+
+    out = _two_route_contention(plugin, tmp_path, monkeypatch, row_write_under_store_lock=True)
+
+    assert out.got_in
+    assert out.loop_gap >= out.busy_for / 4 or out.expired, (
+        f"the loop was not held up ({out.loop_gap:.3f} s) although the row write held "
+        "the store lock: the contention test cannot tell a lock-holding write apart"
+    )
 
 
 # ---------------------------------------------------------------------------
