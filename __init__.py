@@ -92,6 +92,7 @@ import contextlib
 import dataclasses
 import inspect
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
@@ -100,6 +101,33 @@ logger = logging.getLogger("hermes.plugins.session_reset_policy")
 __version__ = "0.3.0"
 
 _META_KEY = "srp_last_user_inbound"
+# This process's own copy of the clock, keyed by route. A store write can be
+# declined (a degraded database, a route that rotated mid-write) and must not
+# cost the reset policy its only evidence of user activity: the next message
+# would read a stalled clock and reset a conversation the user is in.
+_LOCAL_CLOCKS: Dict[str, tuple] = {}
+_LOCAL_CLOCK_MAX = 2000
+_LOCAL_CLOCK_LOCK = threading.Lock()
+
+
+def _remember_clock(session_key: str, session_id: Optional[str], value: str) -> None:
+    """Record the clock in this process before (and whatever) the store does."""
+    if not session_key or not session_id:
+        return
+    with _LOCAL_CLOCK_LOCK:
+        _LOCAL_CLOCKS[session_key] = (session_id, value)
+        if len(_LOCAL_CLOCKS) > _LOCAL_CLOCK_MAX:
+            for stale in list(_LOCAL_CLOCKS)[:_LOCAL_CLOCK_MAX // 4]:
+                _LOCAL_CLOCKS.pop(stale, None)
+
+
+def _local_clock(session_key: str, session_id: Optional[str]) -> Optional[datetime]:
+    """This process's clock for the route, or None once the route rotated."""
+    with _LOCAL_CLOCK_LOCK:
+        stored = _LOCAL_CLOCKS.get(session_key)
+    if stored is None or session_id is None or stored[0] != session_id:
+        return None
+    return _parse_iso(stored[1])
 
 
 def _read_session_reset_policy(profile: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -151,17 +179,28 @@ def _parse_iso(value: Any) -> Optional[datetime]:
     return None
 
 
-def _last_user_inbound(entry: Any) -> Optional[datetime]:
-    """The route's user-activity clock.
+def _last_user_inbound(entry: Any, session_key: Optional[str] = None) -> Optional[datetime]:
+    """The route's user-activity clock: the freshest of
 
-    Order: the plugin's own ``srp_last_user_inbound`` metadata (written only by
-    messages that reach this hook), then ``updated_at``/``created_at`` as a
-    one-time migration fallback for routes that predate the plugin.
+    1. this process's local copy (a store write can be declined; the clock must
+       still advance), and
+    2. the plugin's own ``srp_last_user_inbound`` metadata (written only by
+       messages that reach this hook, and durable across restarts),
+
+    then ``updated_at``/``created_at`` as the one-time migration fallback for
+    routes that predate the plugin.
     """
+    stamps = []
+    if session_key:
+        local = _local_clock(session_key, getattr(entry, "session_id", None))
+        if local is not None:
+            stamps.append(local)
     meta = getattr(entry, "metadata", None) or {}
-    stamp = _parse_iso(meta.get(_META_KEY)) if isinstance(meta, dict) else None
-    if stamp is not None:
-        return stamp
+    persisted = _parse_iso(meta.get(_META_KEY)) if isinstance(meta, dict) else None
+    if persisted is not None:
+        stamps.append(persisted)
+    if stamps:
+        return max(stamps)
     return getattr(entry, "updated_at", None) or getattr(entry, "created_at", None)
 
 
@@ -224,21 +263,22 @@ def _stamp_clock(session_store: Any, session_key: str,
                  expected_session_id: Optional[str], value: str) -> bool:
     """Worker-thread body for the user-activity clock advance.
 
-    Runs off the event loop because the engine's save is synchronous. It also
-    must not stamp the wrong session: the route is read off the loop, so a
-    reset can replace it before the write lands.
+    Runs off the event loop because the engine's save is synchronous. The clock
+    is recorded in this process FIRST: the engine may decline the row (state.db
+    routing unreadable, a route that rotated mid-write), and a declined row must
+    not stall the clock or the next message could idle-reset an active chat.
 
-    ``set_session_metadata_if`` is the engine's fast seam: under the store lock
-    it checks the route's identity and persists ONE routing row, never the
-    whole index whose rewrite held the loop past Discord's heartbeat. Engines
-    without it get ``_update_entry`` (atomic, but a whole-index rewrite) and
-    then a separate peek (best effort). Returns True only when the clock
-    advanced.
+    ``set_session_metadata`` is the engine's single-row write; on an engine that
+    rewrites the whole index it is still off the loop here. Returns the store's
+    answer, which callers log but do not depend on.
     """
-    setter = getattr(session_store, "set_session_metadata_if", None)
-    if callable(setter):
-        return bool(setter(session_key, _META_KEY, value, expected_session_id))
+    _remember_clock(session_key, expected_session_id, value)
 
+    setter = getattr(session_store, "set_session_metadata", None)
+    if callable(setter):
+        return bool(setter(session_key, _META_KEY, value))
+
+    # A store without the session-metadata API: mutate through its seam.
     def _apply(entry: Any) -> bool:
         if expected_session_id is not None and \
                 getattr(entry, "session_id", None) != expected_session_id:
@@ -253,15 +293,7 @@ def _stamp_clock(session_store: Any, session_key: str,
     updater = getattr(session_store, "_update_entry", None)
     if callable(updater):
         return bool(updater(session_key, _apply))
-    if expected_session_id is not None:
-        try:
-            current = session_store.peek_session_id(session_key)
-        except Exception:
-            current = None
-        if current is not None and current != expected_session_id:
-            return False
-    session_store.set_session_metadata(session_key, _META_KEY, value)
-    return True
+    return False
 
 
 def _resolve_session_key(gateway: Any, source: Any, from_payload: Optional[str]) -> Optional[str]:
@@ -428,7 +460,7 @@ async def _maybe_reset_locked(event: Any, gateway: Any, source: Any,
         return None  # no route yet -> brand-new conversation anyway
 
     now = datetime.now()
-    reason = _time_reset_reason(policy, _last_user_inbound(entry), now)
+    reason = _time_reset_reason(policy, _last_user_inbound(entry, key), now)
     if reason is None:
         # Not past the boundary: this message IS the user activity — advance
         # our own clock (never ``updated_at``; see module docstring).

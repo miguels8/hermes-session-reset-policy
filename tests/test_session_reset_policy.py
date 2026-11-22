@@ -753,10 +753,9 @@ def test_policy_reader_resolves_profiles_from_root(plugin, tmp_path, monkeypatch
 # ---------------------------------------------------------------------------
 
 class _LockedStore:
-    """Models the engine's store: ``set_session_metadata_if`` holds the lock
-    across the identity check and the single-row write; ``_update_entry`` is
-    the older seam whose save rewrites the whole index; accessors need the
-    same lock."""
+    """Models the engine's store: ``set_session_metadata`` holds the lock across
+    the single-row write; ``_update_entry`` is the older seam whose save
+    rewrites the whole index; accessors need the same lock."""
 
     def __init__(self, entry):
         self._entry = entry
@@ -764,7 +763,7 @@ class _LockedStore:
         self.stamp_delay = 0.4
         self.stamps = []
         self.used_update_entry = False
-        self.used_metadata_if = False
+        self.used_setter = False
 
     def lookup_by_session_key(self, key):
         with self._lock:
@@ -774,20 +773,13 @@ class _LockedStore:
         with self._lock:
             return self._entry.session_id
 
-    def _write_under_lock(self, meta_key, value, expected_session_id):
-        if expected_session_id is not None and \
-                self._entry.session_id != expected_session_id:
-            return False
-        self._entry.metadata[meta_key] = value
-        self.stamps.append(dict(self._entry.metadata))
-        return True
-
-    def set_session_metadata_if(self, key, meta_key, value,
-                                expected_session_id=None):
-        self.used_metadata_if = True
+    def set_session_metadata(self, key, meta_key, value):
+        self.used_setter = True
         with self._lock:
             time.sleep(self.stamp_delay)  # the synchronous row write
-            return self._write_under_lock(meta_key, value, expected_session_id)
+            self._entry.metadata[meta_key] = value
+            self.stamps.append(dict(self._entry.metadata))
+        return True
 
     def _update_entry(self, key, mutate):
         self.used_update_entry = True
@@ -797,13 +789,6 @@ class _LockedStore:
                 return False
             self.stamps.append(dict(self._entry.metadata))
             return True
-
-    def set_session_metadata(self, key, meta_key, value):
-        with self._lock:
-            time.sleep(self.stamp_delay)
-            self._entry.metadata[meta_key] = value
-            self.stamps.append(value)
-        return True
 
 
 def _entry_within_threshold():
@@ -875,15 +860,14 @@ def test_clock_stamp_does_not_block_the_event_loop(plugin):
     )
 
 
-def test_clock_stamp_uses_the_fast_identity_checked_seam(plugin):
+def test_clock_stamp_uses_the_single_row_setter(plugin):
     """The stamp must persist one row, not rewrite the whole routing index."""
     store = _LockedStore(_entry_within_threshold())
 
     _scenario(plugin, store)
 
-    assert store.used_metadata_if is True, (
-        "the stamp did not use set_session_metadata_if, so the identity check "
-        "and the write are not atomic and the save is not the single-row path"
+    assert store.used_setter is True, (
+        "the stamp did not use set_session_metadata, the engine's single-row write"
     )
     assert store.used_update_entry is False, (
         "the stamp fell back to _update_entry, whose save rewrites the whole "
@@ -923,25 +907,59 @@ def test_stamp_falls_back_to_update_entry_on_an_older_engine(plugin):
 class _RotatesDuringWrite(_LockedStore):
     """The route is replaced just before the stamp takes the store lock."""
 
-    def set_session_metadata_if(self, key, meta_key, value,
-                                expected_session_id=None):
-        self.used_metadata_if = True
+    def set_session_metadata(self, key, meta_key, value):
+        self.used_setter = True
         with self._lock:
             self._entry = _replacement_entry()
             time.sleep(self.stamp_delay)
-            return self._write_under_lock(meta_key, value, expected_session_id)
+            self._entry.metadata[meta_key] = value
+            self.stamps.append(dict(self._entry.metadata))
+            return True
 
 
-def test_clock_stamp_skipped_when_route_rotates_mid_write(plugin):
-    """The BLOCKER: a reset between the read and the write must win."""
+def test_clock_stamp_never_lands_on_the_replacement_route(plugin):
+    """A reset between the read and the write wins.
+
+    The engine refuses a stamp for a route it no longer names (it captures the
+    id it saw), and this process's clock is bound to that id, so a replacement
+    never inherits the old conversation's activity. The store double here has no
+    such guard, which is exactly the point: the plugin must not read the
+    replacement's stamp as its own clock.
+    """
     store = _RotatesDuringWrite(_entry_within_threshold())
 
     _scenario(plugin, store)
 
-    assert store.stamps == [], (
-        "the clock stamp landed on the replacement session instead of being skipped"
+    key = _gateway()._session_key_for_source(None)
+    assert plugin._local_clock(key, "rotated-sid") is None, (
+        "the plugin treated the replacement route as stamped by the old one"
     )
-    assert store._entry.metadata.get(plugin._META_KEY) is None
+    assert plugin._local_clock(key, "seed-sid") is not None
+
+
+def test_a_declined_store_write_still_advances_the_clock(plugin):
+    """A degraded engine returns False; the clock must not stall.
+
+    Without this the next message reads a stale clock and the idle policy
+    resets a conversation the user is in.
+    """
+
+    class _Declines(_LockedStore):
+        def set_session_metadata(self, key, meta_key, value):
+            self.used_setter = True
+            return False
+
+    store = _Declines(_entry_within_threshold())
+    entry = store._entry
+    now = datetime.now()
+
+    key = _gateway()._session_key_for_source(None)
+    assert plugin._stamp_clock(store, key, entry.session_id, now.isoformat()) is False
+
+    read = plugin._last_user_inbound(entry, key)
+    assert read is not None and read.isoformat() == now.isoformat(), (
+        "a declined store write stalled the user-activity clock"
+    )
 
 
 
@@ -955,13 +973,14 @@ class _QueueGapStore(_LockedStore):
         self.queued = threading.Event()
         self.release = threading.Event()
 
-    def set_session_metadata_if(self, key, meta_key, value,
-                                expected_session_id=None):
-        self.used_metadata_if = True
+    def set_session_metadata(self, key, meta_key, value):
+        self.used_setter = True
         self.queued.set()
         self.release.wait(timeout=5)  # queued, not yet applied
         with self._lock:
-            return self._write_under_lock(meta_key, value, expected_session_id)
+            self._entry.metadata[meta_key] = value
+            self.stamps.append(dict(self._entry.metadata))
+            return True
 
 
 class _FakeDateTime(datetime):
@@ -1074,8 +1093,7 @@ def test_cancelled_stamp_still_serializes_the_route(plugin):
 class _FailingSaveStore(_QueueGapStore):
     """The queued save raises after the hook is cancelled."""
 
-    def set_session_metadata_if(self, key, meta_key, value,
-                                expected_session_id=None):
+    def set_session_metadata(self, key, meta_key, value):
         self.queued.set()
         self.release.wait(timeout=5)
         raise OSError("state.db is gone")
