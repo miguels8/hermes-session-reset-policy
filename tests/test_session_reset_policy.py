@@ -20,6 +20,7 @@ import contextlib
 import importlib.util
 import inspect
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -1312,13 +1313,18 @@ def _engine_has_one_row_setter() -> bool:
         mod.SessionStore.set_session_metadata).parameters
 
 
+def _xfail_while_the_engine_carry_is_pending() -> None:
+    """Skip when there is no tree; xfail only on the explicit pending override."""
+    if not _engine_has_one_row_setter() and os.environ.get(ENGINE_FASTPATH_PENDING_ENV) == "1":
+        pytest.xfail("engine has no identity-checked single-row setter yet "
+                     "(carried by job oc-fix-engine-recarry-20261122)")
+
+
 def test_a_stamp_on_one_route_never_holds_up_another_routes_lookup(plugin, tmp_path):
     store = _make_real_store(tmp_path)
     key_a, _entry_a = _seed_route(store, chat_id="route-a")
     key_b, _entry_b = _seed_route(store, chat_id="route-b")
-    if not _engine_has_one_row_setter() and os.environ.get(ENGINE_FASTPATH_PENDING_ENV) == "1":
-        pytest.xfail("engine has no identity-checked single-row setter yet "
-                     "(carried by job oc-fix-engine-recarry-20261122)")
+    _xfail_while_the_engine_carry_is_pending()
 
     busy_for = 1.0                  # how long the whole-index writer stays busy
     release = threading.Event()     # the gate: the writer finishes when this opens
@@ -1365,3 +1371,49 @@ def test_a_stamp_on_one_route_never_holds_up_another_routes_lookup(plugin, tmp_p
     )
     assert store.get_session_metadata(key_a, plugin._META_KEY) is not None
     assert store.get_session_metadata(key_b, plugin._META_KEY) is not None
+
+
+# ---------------------------------------------------------------------------
+# stamp-probe.py: the real-flow probe of the stamp, and its negative control
+#
+# Finding (probe): its rotation proof read the local cache and a write count, so
+# a plugin that dropped the route guard still printed PROBE GREEN. The probe must
+# now see the stale stamp refused and find the replacement's SQLite row clean;
+# this test proves it by running the probe against a plugin that lost the guard.
+# ---------------------------------------------------------------------------
+
+PROBE = PLUGIN_DIR / "stamp-probe.py"
+
+
+def _run_probe(plugin_init: Path, cwd: Path) -> "subprocess.CompletedProcess[str]":
+    env = dict(os.environ, CL_TREE=str(HERMES_TREE), CL_PLUGIN=str(plugin_init),
+               PYTHONDONTWRITEBYTECODE="1")
+    return subprocess.run([sys.executable, "-B", str(PROBE)], capture_output=True,
+                          text=True, timeout=120, env=env, cwd=cwd)
+
+
+def test_the_stamp_probe_is_green_on_the_real_plugin(tmp_path):
+    _xfail_while_the_engine_carry_is_pending()
+
+    out = _run_probe(PLUGIN_INIT, tmp_path)
+
+    assert out.returncode == 0 and "PROBE GREEN" in out.stdout, out.stdout + out.stderr
+
+
+def test_the_stamp_probe_goes_red_when_the_route_guard_is_dropped(tmp_path):
+    """Negative control: the same plugin minus ``expected_session_id`` stamps the
+    replacement route, and the probe must say so."""
+    _xfail_while_the_engine_carry_is_pending()
+    source = PLUGIN_INIT.read_text()
+    guarded_call = ("value,\n                               "
+                    "expected_session_id=expected_session_id))")
+    assert guarded_call in source, "the guarded setter call moved: update this control"
+    mutant = tmp_path / "mutant_init.py"
+    mutant.write_text(source.replace(guarded_call, "value))", 1))
+
+    out = _run_probe(mutant, tmp_path)
+
+    assert out.returncode != 0 and "PROBE RED" in out.stdout, (
+        "the probe stayed green for a plugin that stamps the replacement route:\n"
+        + out.stdout + out.stderr
+    )
