@@ -268,34 +268,45 @@ def test_reset_event_falls_back_for_plain_objects(plugin):
 # _maybe_reset — end-to-end against the REAL SessionStore from the tree
 # ---------------------------------------------------------------------------
 
-class _RoutingCfg:
-    write_sessions_json = True
-
-
 def _make_real_store(tmp_path):
     """Build a real SessionStore over a scratch sessions dir."""
     mod = _import_tree_module("gateway.session")
-    return mod.SessionStore(sessions_dir=tmp_path / "sessions", config=_RoutingCfg())
+    cfg = _import_tree_module("gateway.config")
+    store = mod.SessionStore(sessions_dir=tmp_path / "sessions", config=cfg.GatewayConfig())
+    return store
 
-def _real_source():
+
+def _real_source(chat_id="test-chat"):
     mod = _import_tree_module("gateway.session")
     cfg = _import_tree_module("gateway.config")
-    return mod.SessionSource(platform=cfg.Platform.LOCAL, chat_id="test-chat", chat_type="dm",
+    return mod.SessionSource(platform=cfg.Platform.DISCORD, chat_id=chat_id, chat_type="dm",
                              user_id="tester")
 
-def _seed_route(store, *, key="agent:main:local:dm:test-chat", updated_minutes_ago=0.0, token=None):
-    mod = _import_tree_module("gateway.session")
-    SessionEntry = mod.SessionEntry
-    src = _real_source()
-    entry = SessionEntry(
-        session_key=key, session_id="seed-sid",
-        created_at=datetime.now() - timedelta(minutes=updated_minutes_ago),
-        updated_at=datetime.now() - timedelta(minutes=updated_minutes_ago),
-        origin=src, platform=None, chat_type="dm",
-        active_turn_token=token,
-    )
-    store._entries[key] = entry
-    store._loaded = True
+def _real_event(text="please keep going", chat_id="test-chat"):
+    """A real inbound MessageEvent (it carries ``accept_interrupt``, which the
+    gateway's reset handler calls), not a stand-in namespace."""
+    event_mod = _import_tree_module("gateway.platforms.event")
+    return event_mod.MessageEvent(text=text, source=_real_source(chat_id))
+
+def _seed_route(store, *, chat_id="test-chat", updated_minutes_ago=0.0, token=None):
+    """Open a genuine route through the engine's own door, then age its clock.
+
+    ``get_or_create_session`` is what a first message calls, so the route carries
+    every record the engine's reset path reads. The old hand-built entry skipped
+    them and, being a LOCAL route, every rotation died on a missing local
+    authority epoch: a LOCAL route needs a booted gateway, and the plugin's
+    traffic is messaging platforms, so the route is a Discord one. The user
+    clock is back-dated through the engine's own setter (the plugin's real
+    store), and ``token`` marks a turn in flight. Returns ``(key, entry)``; the
+    session id is the engine's, not a constant.
+    """
+    entry = store.get_or_create_session(_real_source(chat_id))
+    key = entry.session_key
+    assert store.lookup_by_session_key(key) is entry
+    if updated_minutes_ago:
+        aged = datetime.now() - timedelta(minutes=updated_minutes_ago)
+        assert store.set_session_metadata(key, "srp_last_user_inbound", aged.isoformat())
+    entry.active_turn_token = token
     return key, entry
 
 
@@ -317,18 +328,18 @@ def test_maybe_reset_store_fallback_calls_real_reset_session(plugin, tmp_path, h
     assert result is None  # allow normal dispatch
     new_entry = store.lookup_by_session_key(key)
     assert new_entry is not None
-    assert new_entry.session_id != "seed-sid"
+    assert new_entry.session_id != entry.session_id
     assert new_entry.is_fresh_reset is True
     # In-flight delegations end with the old conversation (review #2, item 3).
     assert hook_recorder.interrupts
     assert hook_recorder.interrupts[0]["session_key"] == key
-    assert hook_recorder.interrupts[0]["parent_session_id"] == "seed-sid"
+    assert hook_recorder.interrupts[0]["parent_session_id"] == entry.session_id
     # Boundary hooks fire (review #2, item 2): finalize for the old id, reset for the new.
     fired = [name for name, _ in hook_recorder.lifecycle]
     assert "on_session_finalize" in fired
     assert "on_session_reset" in fired
     reset_kw = dict(hook_recorder.lifecycle)["on_session_reset"]
-    assert reset_kw["old_session_id"] == "seed-sid"
+    assert reset_kw["old_session_id"] == entry.session_id
     assert reset_kw["new_session_id"] == new_entry.session_id
 
 def test_maybe_reset_prefers_the_gateway_funnel(plugin, tmp_path, hook_recorder):
@@ -378,7 +389,7 @@ def test_maybe_reset_funnel_failure_before_rotation_falls_back(plugin, tmp_path,
         assert _run(plugin._maybe_reset(event, gateway, store)) is None
 
     new_entry = store.lookup_by_session_key(key)
-    assert new_entry.session_id != "seed-sid"
+    assert new_entry.session_id != entry.session_id
     assert new_entry.is_fresh_reset is True
     assert hook_recorder.interrupts  # fallback still ends old delegations
 
@@ -408,10 +419,9 @@ def test_maybe_reset_prefers_payload_session_key(plugin, tmp_path):
     """A public session_key in the hook payload outranks the private gateway
     helper (review #2, item 4: ready for the payload equivalent they offered)."""
     store = _make_real_store(tmp_path)
-    payload_key = "agent:main:local:dm:payload-chat"
-    helper_key = "agent:main:local:dm:helper-chat"
-    _seed_route(store, key=payload_key, updated_minutes_ago=5)
-    _seed_route(store, key=helper_key, updated_minutes_ago=5)
+    payload_key, _ = _seed_route(store, chat_id="payload-chat")
+    helper_key, _ = _seed_route(store, chat_id="helper-chat")
+    assert payload_key != helper_key
     gateway = SimpleNamespace(_session_key_for_source=lambda src: helper_key)
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}  # within threshold -> clock-stamp path
@@ -439,7 +449,7 @@ def test_maybe_reset_bg_turn_does_not_block_reset(plugin, tmp_path, hook_recorde
         assert _run(plugin._maybe_reset(event, gateway, store)) is None
 
     new_entry = store.lookup_by_session_key(key)
-    assert new_entry.session_id != "seed-sid"
+    assert new_entry.session_id != entry.session_id
     assert new_entry.is_fresh_reset is True
 
 def test_maybe_reset_stamps_clock_when_within_threshold(plugin, tmp_path):
@@ -454,7 +464,7 @@ def test_maybe_reset_stamps_clock_when_within_threshold(plugin, tmp_path):
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
         assert _run(plugin._maybe_reset(event, gateway, store)) is None
 
-    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    assert store.lookup_by_session_key(key).session_id == entry.session_id
     stamp = store.get_session_metadata(key, "srp_last_user_inbound")
     assert stamp is not None
     assert datetime.fromisoformat(stamp) >= before
@@ -464,15 +474,17 @@ def test_maybe_reset_deferral_does_not_advance_clock(plugin, tmp_path):
     next message re-evaluates the same boundary."""
     store = _make_real_store(tmp_path)
     key, entry = _seed_route(store, updated_minutes_ago=120, token="tok-123")
+    seeded_clock = store.get_session_metadata(key, "srp_last_user_inbound")
+    assert seeded_clock is not None
     gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
         assert _run(plugin._maybe_reset(event, gateway, store)) is None
 
-    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    assert store.lookup_by_session_key(key).session_id == entry.session_id
     # No clock stamp: the deferral must not swallow the pending reset.
-    assert store.get_session_metadata(key, "srp_last_user_inbound") is None
+    assert store.get_session_metadata(key, "srp_last_user_inbound") == seeded_clock
 
 def test_maybe_reset_skips_when_within_threshold(plugin, tmp_path):
     store = _make_real_store(tmp_path)
@@ -483,7 +495,7 @@ def test_maybe_reset_skips_when_within_threshold(plugin, tmp_path):
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
         assert _run(plugin._maybe_reset(event, gateway, store)) is None
 
-    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    assert store.lookup_by_session_key(key).session_id == entry.session_id
 
 def test_maybe_reset_defers_when_turn_in_flight(plugin, tmp_path):
     store = _make_real_store(tmp_path)
@@ -495,7 +507,7 @@ def test_maybe_reset_defers_when_turn_in_flight(plugin, tmp_path):
         assert _run(plugin._maybe_reset(event, gateway, store)) is None
 
     # Route unchanged: the in-flight turn keeps its session.
-    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    assert store.lookup_by_session_key(key).session_id == entry.session_id
 
 def test_maybe_reset_no_policy_no_op(plugin, tmp_path):
     store = _make_real_store(tmp_path)
@@ -504,7 +516,7 @@ def test_maybe_reset_no_policy_no_op(plugin, tmp_path):
     event = SimpleNamespace(source=_real_source(), internal=False)
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=None):
         assert _run(plugin._maybe_reset(event, gateway, store)) is None
-    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    assert store.lookup_by_session_key(key).session_id == entry.session_id
 
 def test_maybe_reset_survives_store_errors(plugin, tmp_path):
     class ExplodingStore:
@@ -537,7 +549,7 @@ def test_maybe_reset_survives_missing_key_helper(plugin, tmp_path):
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
         assert _run(plugin._maybe_reset(event, gateway, store)) is None
-    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    assert store.lookup_by_session_key(key).session_id == entry.session_id
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +570,8 @@ def _real_funnel_gateway(store, key):
     slash_mod = _import_tree_module("gateway.slash_commands_session")
     mixin = slash_mod.GatewaySessionCommandsMixin
 
-    calls = SimpleNamespace(invalidated=[], released=[], evicted=[], cleared=[], finalize=[])
+    calls = SimpleNamespace(invalidated=[], released=[], evicted=[], cleared=[], finalize=[],
+                            stopped=[], delivered=[])
 
     class _Hooks:
         def __init__(self):
@@ -569,6 +582,18 @@ def _real_funnel_gateway(store, key):
 
     async def _finalize_session_off_loop(**kw):
         calls.finalize.append(kw)
+
+    async def _hm_stop_owner_turn(session_key):
+        calls.stopped.append(session_key)
+
+    async def _reset_session_off_loop(*, session_key=None, **kwargs):
+        # The engine runs this body in an executor under the owning profile's
+        # scope; the body itself is the one plugin hook call.
+        from hermes_cli.lifecycle import invoke_hook
+        invoke_hook("on_session_reset", **kwargs)
+
+    async def _deliver_session_end_messages(messages, **kw):
+        calls.delivered.append(messages)
 
     gw = SimpleNamespace()
     gw.session_store = store
@@ -581,11 +606,16 @@ def _real_funnel_gateway(store, key):
     gw._evict_cached_agent = lambda k: calls.evicted.append(k)
     gw._clear_conversation_scope = lambda k, reason="": calls.cleared.append((k, reason))
     gw._finalize_session_off_loop = _finalize_session_off_loop
+    gw._hm_stop_owner_turn = _hm_stop_owner_turn
+    gw._reset_session_off_loop = _reset_session_off_loop
+    gw._reset_notice_session_info = lambda source: ""
+    gw._deliver_session_end_messages = _deliver_session_end_messages
+    gw._async_profile_scope_for_source = lambda source: contextlib.nullcontext()
     gw._telegram_topic_new_header = lambda source: ""
     gw._is_telegram_topic_lane = lambda source: False
     gw._session_db = None
     for name in ("_handle_reset_command", "_fire_session_reset_hooks",
-                 "_cleanup_old_agent_for_reset"):
+                 "_fire_plugin_session_reset", "_cleanup_old_agent_for_reset"):
         setattr(gw, name, getattr(mixin, name).__get__(gw))
     return gw, calls, slash_mod
 
@@ -595,7 +625,7 @@ def test_maybe_reset_runs_the_real_new_funnel(plugin, tmp_path, hook_recorder, m
     key, entry = _seed_route(store, updated_minutes_ago=120)
     gw, calls, slash_mod = _real_funnel_gateway(store, key)
     monkeypatch.setattr(slash_mod, "t", lambda key_name, **kw: key_name)  # no i18n in tests
-    event = SimpleNamespace(source=_real_source(), internal=False)
+    event = _real_event()  # the real handler calls event.accept_interrupt()
 
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -603,7 +633,7 @@ def test_maybe_reset_runs_the_real_new_funnel(plugin, tmp_path, hook_recorder, m
 
     new_entry = store.lookup_by_session_key(key)
     assert new_entry is not None
-    assert new_entry.session_id != "seed-sid"
+    assert new_entry.session_id != entry.session_id
     assert new_entry.is_fresh_reset is True
     # Item 1: run-generation bump, running-slot release, cached-agent eviction,
     # conversation-scope clear — the exact /new boundary sequence.
@@ -614,16 +644,16 @@ def test_maybe_reset_runs_the_real_new_funnel(plugin, tmp_path, hook_recorder, m
     # Item 2: gateway session:end / session:reset hooks + on_session_finalize.
     assert [name for name, _ in gw.hooks.emitted] == ["session:end", "session:reset"]
     assert gw.hooks.emitted[0][1]["session_key"] == key
-    assert calls.finalize and calls.finalize[0]["session_id"] == "seed-sid"
+    assert calls.finalize and calls.finalize[0]["session_id"] == entry.session_id
     assert calls.finalize[0]["new_session_id"] == new_entry.session_id
     fired = dict(hook_recorder.lifecycle)
     assert "on_session_reset" in fired
-    assert fired["on_session_reset"]["old_session_id"] == "seed-sid"
+    assert fired["on_session_reset"]["old_session_id"] == entry.session_id
     assert fired["on_session_reset"]["new_session_id"] == new_entry.session_id
     # Item 3: in-flight async delegations end with the old conversation.
     assert hook_recorder.interrupts
     assert hook_recorder.interrupts[0]["session_key"] == key
-    assert hook_recorder.interrupts[0]["parent_session_id"] == "seed-sid"
+    assert hook_recorder.interrupts[0]["parent_session_id"] == entry.session_id
 
 
 # ---------------------------------------------------------------------------
