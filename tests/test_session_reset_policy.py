@@ -1078,8 +1078,14 @@ def test_a_declined_store_write_still_advances_the_clock(plugin):
 
 
 class _QueueGapStore(_LockedStore):
-    """Models the executor queue gap: the stamp is submitted but has not yet
-    taken the store lock, so an inline read still sees the old clock."""
+    """Models the executor queue gap: the stamp is submitted but nothing it does
+    is visible yet, so an inline read still sees the old clock.
+
+    ``queued``/``release`` are the gate; ``_gated_clock_publication`` places it
+    BEFORE the plugin publishes its process-local clock. A gate inside the store
+    call opens too late: the plugin has already advanced its own copy, a second
+    message reads that copy, and the ordering tests passed with no route lock.
+    """
 
     def __init__(self, entry):
         super().__init__(entry)
@@ -1089,8 +1095,6 @@ class _QueueGapStore(_LockedStore):
 
     def set_session_metadata(self, key, meta_key, value, expected_session_id=None):
         self.used_setter = True
-        self.queued.set()
-        self.release.wait(timeout=5)  # queued, not yet applied
         with self._lock:
             if expected_session_id is not None and \
                     self._entry.session_id != expected_session_id:
@@ -1108,12 +1112,35 @@ class _FakeDateTime(datetime):
         return cls.current
 
 
-def test_overlapping_messages_on_one_route_keep_their_order(plugin):
-    """BLOCKER (round 6): message 2 must not read the clock before message 1's
-    off-loop stamp lands, or a boundary crossed between them fires a reset that
-    the baseline never fired."""
+@contextlib.contextmanager
+def _gated_clock_publication(plugin, store):
+    """Hold the stamp worker before it publishes the clock anywhere.
+
+    The worker's first act is ``_remember_clock``; parking it there means no
+    reader, local or durable, can see message 1's arrival until ``release``.
+    """
+    real = plugin._remember_clock
+
+    def gated(session_key, session_id, value):
+        store.queued.set()
+        store.release.wait(timeout=5)  # pending: nothing published yet
+        real(session_key, session_id, value)
+
+    with mock.patch.object(plugin, "_remember_clock", gated):
+        yield
+
+
+def _run_overlap(plugin, *, cancel_first, route_lock=True):
+    """Two messages on one route while the first stamp is pending.
+
+    The first message's stamp is held open; the boundary is crossed; the second
+    message arrives. With the route lock the second hook waits for the first
+    stamp, reads the fresh clock and does not reset. Without the lock (a control,
+    ``route_lock=False``) it reads the old clock and resets: the scenario can
+    therefore fail, which is what makes the passing runs mean something.
+    """
     # Patching the module's ``datetime`` shadows the isinstance() base class, so
-    # every timestamp this test produces is a _FakeDateTime.
+    # every timestamp this scenario produces is a _FakeDateTime.
     base = _FakeDateTime(2026, 11, 21, 12, 0, 0)
     entry = SimpleNamespace(metadata={}, updated_at=base, created_at=base,
                             active_turn_token=None, session_id="seed-sid")
@@ -1130,6 +1157,7 @@ def test_overlapping_messages_on_one_route_keep_their_order(plugin):
     )
     event = SimpleNamespace(source=SimpleNamespace(profile=None), internal=False)
     policy = {"mode": "idle", "idle_minutes": 1}  # 60 s boundary
+    seen = SimpleNamespace(second_done_while_pending=None)
 
     original_datetime = plugin.datetime
     plugin.datetime = _FakeDateTime
@@ -1138,73 +1166,79 @@ def test_overlapping_messages_on_one_route_keep_their_order(plugin):
         async def run():
             with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
                 first = asyncio.create_task(plugin._maybe_reset(event, gateway, store))
-                await asyncio.to_thread(store.queued.wait, 5)  # first stamp is queued
+                await asyncio.to_thread(store.queued.wait, 5)  # first stamp is pending
+                if cancel_first:
+                    first.cancel()
+                    await asyncio.sleep(0)  # deliver the cancellation
                 _FakeDateTime.current = _FakeDateTime(2026, 11, 21, 12, 1, 1)  # boundary crossed
                 second = asyncio.create_task(plugin._maybe_reset(event, gateway, store))
                 await asyncio.sleep(0.05)
+                seen.second_done_while_pending = second.done()
                 store.release.set()
-                await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+                if cancel_first:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.wait_for(first, timeout=10)
+                    await asyncio.wait_for(second, timeout=10)
+                else:
+                    await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
 
-        asyncio.run(run())
+        with _gated_clock_publication(plugin, store):
+            if route_lock:
+                asyncio.run(run())
+            else:
+                with mock.patch.object(plugin, "_route_lock_for",
+                                       lambda _key: contextlib.nullcontext()):
+                    asyncio.run(run())
     finally:
         plugin.datetime = original_datetime
+    return SimpleNamespace(funnel_calls=funnel_calls, store=store, seen=seen)
 
-    assert funnel_calls == [], (
+
+def test_overlapping_messages_on_one_route_keep_their_order(plugin):
+    """BLOCKER (round 6): message 2 must not read the clock before message 1's
+    off-loop stamp lands, or a boundary crossed between them fires a reset that
+    the baseline never fired."""
+    out = _run_overlap(plugin, cancel_first=False)
+
+    assert out.seen.second_done_while_pending is False, (
+        "the second message got through the hook while the first stamp was pending"
+    )
+    assert out.funnel_calls == [], (
         "the second message read a stale clock and reset a session the first "
         "message had just stamped"
     )
-    assert len(store.stamps) == 2, "both arrivals must still advance the clock"
-
+    assert len(out.store.stamps) == 2, "both arrivals must still advance the clock"
 
 
 def test_cancelled_stamp_still_serializes_the_route(plugin):
     """BLOCKER (round 7): cancelling the hook must not release the route lock
     while the save is still in flight, or the next message reads a stale clock."""
-    base = _FakeDateTime(2026, 11, 21, 12, 0, 0)
-    entry = SimpleNamespace(metadata={}, updated_at=base, created_at=base,
-                            active_turn_token=None, session_id="seed-sid")
-    store = _QueueGapStore(entry)
-    funnel_calls = []
+    out = _run_overlap(plugin, cancel_first=True)
 
-    def funnel(_event):
-        funnel_calls.append(1)
-        return None
-
-    gateway = SimpleNamespace(
-        _session_key_for_source=lambda src: "route-1",
-        _handle_reset_command=funnel,
+    assert out.seen.second_done_while_pending is False, (
+        "the second message got through the hook while the cancelled stamp was pending"
     )
-    event = SimpleNamespace(source=SimpleNamespace(profile=None), internal=False)
-    policy = {"mode": "idle", "idle_minutes": 1}
-
-    original_datetime = plugin.datetime
-    plugin.datetime = _FakeDateTime
-    _FakeDateTime.current = _FakeDateTime(2026, 11, 21, 12, 0, 30)
-    try:
-        async def run():
-            with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
-                first = asyncio.create_task(plugin._maybe_reset(event, gateway, store))
-                await asyncio.to_thread(store.queued.wait, 5)  # worker holds the write
-                first.cancel()
-                await asyncio.sleep(0)  # deliver the cancellation
-                _FakeDateTime.current = _FakeDateTime(2026, 11, 21, 12, 1, 1)
-                second = asyncio.create_task(plugin._maybe_reset(event, gateway, store))
-                await asyncio.sleep(0.05)
-                store.release.set()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.wait_for(first, timeout=10)
-                await asyncio.wait_for(second, timeout=10)
-
-        asyncio.run(run())
-    finally:
-        plugin.datetime = original_datetime
-
-    assert funnel_calls == [], (
+    assert out.funnel_calls == [], (
         "a cancelled hook released the route lock mid-save, so the next message "
         "read a stale clock and reset the session"
     )
-    assert len(store.stamps) == 2, "both arrivals must still advance the clock"
+    assert out.store.stamps and len(out.store.stamps) == 2, \
+        "both arrivals must still advance the clock"
 
+
+def test_the_overlap_scenario_notices_a_missing_route_lock(plugin):
+    """Negative control (RULES 13): without the route lock the second message
+    resets the session, so the ordering test above can really fail. It once could
+    not: the clock was published locally before the test's gate opened."""
+    out = _run_overlap(plugin, cancel_first=False, route_lock=False)
+
+    assert out.funnel_calls == [1], "the scenario cannot tell a missing route lock apart"
+
+
+def test_the_cancel_scenario_notices_a_missing_route_lock(plugin):
+    out = _run_overlap(plugin, cancel_first=True, route_lock=False)
+
+    assert out.funnel_calls == [1], "the scenario cannot tell a missing route lock apart"
 
 
 class _FailingSaveStore(_QueueGapStore):
