@@ -952,16 +952,18 @@ def test_a_refreshed_route_is_not_evicted_by_the_cap(plugin):
     old_max = plugin._LOCAL_CLOCK_MAX
     try:
         plugin._LOCAL_CLOCKS.clear()
-        plugin._LOCAL_CLOCK_MAX = 3
+        plugin._LOCAL_CLOCK_MAX = 4  # capacity pressure evicts cap // 4 == one entry
         plugin._remember_clock("busy", "sid", "2026-11-21T10:50:00")
         plugin._remember_clock("a", "sid", "2026-11-21T10:00:00")
         plugin._remember_clock("b", "sid", "2026-11-21T10:00:00")
         plugin._remember_clock("busy", "sid", "2026-11-21T10:55:00")  # refreshed
-        plugin._remember_clock("c", "sid", "2026-11-21T10:00:00")  # pushes past the cap
+        plugin._remember_clock("c", "sid", "2026-11-21T10:00:00")
+        plugin._remember_clock("d", "sid", "2026-11-21T10:00:00")  # pushes past the cap
 
         assert plugin._local_clock("busy", "sid") is not None, (
             "the busiest route lost its only fresh clock to capacity pressure"
         )
+        assert plugin._local_clock("a", "sid") is None, "nothing was evicted"
     finally:
         plugin._LOCAL_CLOCKS.clear()
         plugin._LOCAL_CLOCKS.update(saved)
