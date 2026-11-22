@@ -773,10 +773,13 @@ class _LockedStore:
         with self._lock:
             return self._entry.session_id
 
-    def set_session_metadata(self, key, meta_key, value):
+    def set_session_metadata(self, key, meta_key, value, expected_session_id=None):
         self.used_setter = True
         with self._lock:
             time.sleep(self.stamp_delay)  # the synchronous row write
+            if expected_session_id is not None and \
+                    self._entry.session_id != expected_session_id:
+                return False
             self._entry.metadata[meta_key] = value
             self.stamps.append(dict(self._entry.metadata))
         return True
@@ -907,11 +910,14 @@ def test_stamp_falls_back_to_update_entry_on_an_older_engine(plugin):
 class _RotatesDuringWrite(_LockedStore):
     """The route is replaced just before the stamp takes the store lock."""
 
-    def set_session_metadata(self, key, meta_key, value):
+    def set_session_metadata(self, key, meta_key, value, expected_session_id=None):
         self.used_setter = True
         with self._lock:
             self._entry = _replacement_entry()
             time.sleep(self.stamp_delay)
+            if expected_session_id is not None and \
+                    self._entry.session_id != expected_session_id:
+                return False
             self._entry.metadata[meta_key] = value
             self.stamps.append(dict(self._entry.metadata))
             return True
@@ -931,10 +937,35 @@ def test_clock_stamp_never_lands_on_the_replacement_route(plugin):
     _scenario(plugin, store)
 
     key = _gateway()._session_key_for_source(None)
+    assert store.stamps == [], (
+        "the clock landed on the replacement route instead of being refused"
+    )
     assert plugin._local_clock(key, "rotated-sid") is None, (
         "the plugin treated the replacement route as stamped by the old one"
     )
     assert plugin._local_clock(key, "seed-sid") is not None
+
+
+def test_a_refreshed_route_is_not_evicted_by_the_cap(plugin):
+    """Eviction takes the least recently stamped route, not the oldest key."""
+    saved = dict(plugin._LOCAL_CLOCKS)
+    old_max = plugin._LOCAL_CLOCK_MAX
+    try:
+        plugin._LOCAL_CLOCKS.clear()
+        plugin._LOCAL_CLOCK_MAX = 3
+        plugin._remember_clock("busy", "sid", "2026-11-21T10:50:00")
+        plugin._remember_clock("a", "sid", "2026-11-21T10:00:00")
+        plugin._remember_clock("b", "sid", "2026-11-21T10:00:00")
+        plugin._remember_clock("busy", "sid", "2026-11-21T10:55:00")  # refreshed
+        plugin._remember_clock("c", "sid", "2026-11-21T10:00:00")  # pushes past the cap
+
+        assert plugin._local_clock("busy", "sid") is not None, (
+            "the busiest route lost its only fresh clock to capacity pressure"
+        )
+    finally:
+        plugin._LOCAL_CLOCKS.clear()
+        plugin._LOCAL_CLOCKS.update(saved)
+        plugin._LOCAL_CLOCK_MAX = old_max
 
 
 def test_a_declined_store_write_still_advances_the_clock(plugin):
@@ -945,7 +976,7 @@ def test_a_declined_store_write_still_advances_the_clock(plugin):
     """
 
     class _Declines(_LockedStore):
-        def set_session_metadata(self, key, meta_key, value):
+        def set_session_metadata(self, key, meta_key, value, expected_session_id=None):
             self.used_setter = True
             return False
 
@@ -973,11 +1004,14 @@ class _QueueGapStore(_LockedStore):
         self.queued = threading.Event()
         self.release = threading.Event()
 
-    def set_session_metadata(self, key, meta_key, value):
+    def set_session_metadata(self, key, meta_key, value, expected_session_id=None):
         self.used_setter = True
         self.queued.set()
         self.release.wait(timeout=5)  # queued, not yet applied
         with self._lock:
+            if expected_session_id is not None and \
+                    self._entry.session_id != expected_session_id:
+                return False
             self._entry.metadata[meta_key] = value
             self.stamps.append(dict(self._entry.metadata))
             return True
@@ -1093,7 +1127,7 @@ def test_cancelled_stamp_still_serializes_the_route(plugin):
 class _FailingSaveStore(_QueueGapStore):
     """The queued save raises after the hook is cancelled."""
 
-    def set_session_metadata(self, key, meta_key, value):
+    def set_session_metadata(self, key, meta_key, value, expected_session_id=None):
         self.queued.set()
         self.release.wait(timeout=5)
         raise OSError("state.db is gone")

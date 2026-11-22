@@ -115,6 +115,7 @@ def _remember_clock(session_key: str, session_id: Optional[str], value: str) -> 
     if not session_key or not session_id:
         return
     with _LOCAL_CLOCK_LOCK:
+        _LOCAL_CLOCKS.pop(session_key, None)  # re-insert: eviction is least-recently-stamped
         _LOCAL_CLOCKS[session_key] = (session_id, value)
         if len(_LOCAL_CLOCKS) > _LOCAL_CLOCK_MAX:
             for stale in list(_LOCAL_CLOCKS)[:_LOCAL_CLOCK_MAX // 4]:
@@ -259,6 +260,26 @@ def _lookup_entry(session_store: Any, session_key: Optional[str]) -> Any:
         return None
 
 
+_GUARDED_SETTER: Dict[Any, bool] = {}
+
+
+def _setter_takes_expected_id(setter: Any) -> bool:
+    """Whether the engine's ``set_session_metadata`` accepts the route guard.
+
+    The guard keeps the old conversation's clock off its replacement: the check
+    and the mutation share the engine's store lock. Cached per setter function.
+    """
+    key = getattr(setter, "__func__", setter)
+    cached = _GUARDED_SETTER.get(key)
+    if cached is None:
+        try:
+            cached = "expected_session_id" in inspect.signature(setter).parameters
+        except (TypeError, ValueError):
+            cached = False
+        _GUARDED_SETTER[key] = cached
+    return cached
+
+
 def _stamp_clock(session_store: Any, session_key: str,
                  expected_session_id: Optional[str], value: str) -> bool:
     """Worker-thread body for the user-activity clock advance.
@@ -274,11 +295,6 @@ def _stamp_clock(session_store: Any, session_key: str,
     """
     _remember_clock(session_key, expected_session_id, value)
 
-    setter = getattr(session_store, "set_session_metadata", None)
-    if callable(setter):
-        return bool(setter(session_key, _META_KEY, value))
-
-    # A store without the session-metadata API: mutate through its seam.
     def _apply(entry: Any) -> bool:
         if expected_session_id is not None and \
                 getattr(entry, "session_id", None) != expected_session_id:
@@ -290,6 +306,19 @@ def _stamp_clock(session_store: Any, session_key: str,
         entry.metadata[_META_KEY] = value
         return True
 
+    setter = getattr(session_store, "set_session_metadata", None)
+    if callable(setter):
+        if _setter_takes_expected_id(setter):
+            return bool(setter(session_key, _META_KEY, value,
+                               expected_session_id=expected_session_id))
+        # An engine without the guard: use its mutation seam, which applies the
+        # identity check and the write under one store lock.
+        updater = getattr(session_store, "_update_entry", None)
+        if callable(updater):
+            return bool(updater(session_key, _apply))
+        return bool(setter(session_key, _META_KEY, value))
+
+    # A store without the session-metadata API: mutate through its seam.
     updater = getattr(session_store, "_update_entry", None)
     if callable(updater):
         return bool(updater(session_key, _apply))
@@ -464,10 +493,11 @@ async def _maybe_reset_locked(event: Any, gateway: Any, source: Any,
     if reason is None:
         # Not past the boundary: this message IS the user activity — advance
         # our own clock (never ``updated_at``; see module docstring).
-        # Off the loop: ``set_session_metadata`` serializes and rewrites the
-        # whole routing index synchronously, so under writer contention it can
-        # block for seconds. Run inline it starved the gateway heartbeat past
-        # Discord's 10 s deadline and forced a reconnect (sig:system|bacda61e84).
+        # Off the loop: ``set_session_metadata`` persists synchronously, and on an
+        # engine that still rewrites the whole routing index it can block for
+        # seconds under writer contention. Run inline it starved the gateway
+        # heartbeat past Discord's 10 s deadline (sig:system|bacda61e84); the
+        # 2026-11-21 reconnect came from the same write (sig:system|e001fd8d32).
         worker = asyncio.ensure_future(asyncio.to_thread(
             _stamp_clock, session_store, key,
             getattr(entry, "session_id", None), now.isoformat(),
