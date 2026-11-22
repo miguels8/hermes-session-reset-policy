@@ -32,7 +32,22 @@ import pytest
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 PLUGIN_INIT = PLUGIN_DIR / "__init__.py"
-HERMES_TREE = Path.home() / ".hermes" / "hermes-agent"
+def _hermes_tree() -> Path:
+    """The Hermes checkout the real-engine tests import.
+
+    ``SRP_HERMES_TREE`` lets an evidence run point at the exact candidate
+    worktree; without it, the installed tree for this user. On this host that
+    path does not exist (the canonical checkout is ``/home/santo/dev``), so the
+    real-engine tests skip unless the override is set — the standalone seam
+    tests still run.
+    """
+    override = os.environ.get("SRP_HERMES_TREE")
+    if override:
+        return Path(override)
+    return Path.home() / ".hermes" / "hermes-agent"
+
+
+HERMES_TREE = _hermes_tree()
 
 
 def _run(coro):
