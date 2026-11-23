@@ -1,9 +1,20 @@
 name: tests
 
+# test-speed-standard-20261122: pull requests run the suite only when code, dependencies or this workflow changed (not for README or LICENSE
+# edits), and a newer push to a pull request cancels the older run.
 on:
   push:
     branches: [main]
   pull_request:
+    paths:
+      - "**.py"
+      - "requirements*.txt"
+      - "plugin.yaml"
+      - ".github/workflows/pytest.yml"
+
+concurrency:
+  group: tests-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # The integration tests import the real gateway SessionStore/SessionEntry
