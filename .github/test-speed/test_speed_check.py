@@ -466,12 +466,6 @@ def main(argv: list[str] | None = None) -> int:
     if not root.is_dir():
         print(f"test-speed: cannot read {root}", file=sys.stderr)
         return 2
-    try:
-        cfg = load_config(root)
-    except ValueError as exc:
-        print(f"test-speed: unreadable config {exc}", file=sys.stderr)
-        return 2
-    budget = cfg["budget_min"]
     github, workflows, actions_dir = root / ".github", root / ".github" / "workflows", root / ".github" / "actions"
     files = sorted(p for pattern in ("*.yml", "*.yaml") for p in workflows.glob(pattern))
     action_dirs = sorted(actions_dir.glob("*")) if actions_dir.is_dir() else []
@@ -481,6 +475,12 @@ def main(argv: list[str] | None = None) -> int:
     if any(q.is_symlink() or not (os.path.realpath(q) + os.sep).startswith(real_root + os.sep) for q in reads):
         print("test-speed: refusing a path that is a symlink or resolves outside the checkout (workflows, actions or config): the check reads only files inside the tree", file=sys.stderr)
         return 2
+    try:  # the guard above has already judged every path; nothing is opened before it
+        cfg = load_config(root)
+    except ValueError as exc:
+        print(f"test-speed: unreadable config {exc}", file=sys.stderr)
+        return 2
+    budget = cfg["budget_min"]
     actions = {f"./.github/actions/{q.parent.name}": q.read_text() for q in action_files}
     found: list[Finding] = []
     lines: list[str] = []
@@ -522,8 +522,11 @@ def main(argv: list[str] | None = None) -> int:
     print("\n".join(lines))
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
-        with open(summary, "a") as fh:
-            fh.write("\n".join(lines) + "\n")
+        try:  # the verdict is the exit code and stdout above; a read-only or missing summary file (the runner's sandbox) must not change it
+            with open(summary, "a") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except OSError as exc:
+            print(f"test-speed: step summary not written ({type(exc).__name__})", file=sys.stderr)
     return 1 if found else 0
 
 
