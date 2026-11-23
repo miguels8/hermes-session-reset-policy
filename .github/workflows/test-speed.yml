@@ -1,0 +1,53 @@
+name: Test speed
+# Copy of miguels8/hermes-home .github/workflows/test-speed.yml; the checker beside it (.github/test-speed/) is byte-identical to hermes-home
+# tools/test_speed_check.py, and tools/ci_speed_alarm.py there alarms when a copy drifts.
+# test-speed-standard-20261122 (Miguel 2026-11-22 22:53 CT: tests last the least time possible, enforced hard). The blocking check `test-speed`:
+# a workflow must not chain test stages as separate runner jobs, must cancel the older run of a pull request, and must not run the full suite
+# on every push without a selector; and the latest finished run of each workflow of this pull request must be inside the time budget (.test-speed.json).
+# pull_request_target on purpose: GitHub reads THIS file and the checker from the base branch, so a pull request cannot edit, delete or replace the
+# job that judges it. The pull request's files are only read as data; none of its code runs here. A base without the checker fails the job.
+'on':
+  pull_request_target:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  test-speed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch the base (the checker) and the candidate (data only) without stored credentials
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+          find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c "http.extraheader=$auth" fetch -q --depth=1 origin "$CANDIDATE" "$BASE"
+          git show "$BASE:.github/test-speed/test_speed_check.py" > "$RUNNER_TEMP/test_speed_check.py"
+          git checkout -q --detach "$CANDIDATE"
+      - name: PyYAML for the checker, in a venv (the system Python is externally managed)
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -eu
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --disable-pip-version-check --only-binary=:all: pyyaml
+      - name: Workflows, concurrency and time budget
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/test_speed_check.py" --root "$GITHUB_WORKSPACE" --repo "$GITHUB_REPOSITORY" --branch "$HEAD_REF" --pr-number "$PR_NUMBER"
