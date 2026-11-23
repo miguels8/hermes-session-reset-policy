@@ -472,11 +472,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"test-speed: unreadable config {exc}", file=sys.stderr)
         return 2
     budget = cfg["budget_min"]
-    files = sorted(p for pattern in ("*.yml", "*.yaml") for p in (root / ".github" / "workflows").glob(pattern))
-    actions = {f"./.github/actions/{p.parent.name}": p.read_text() for pattern in ("action.yml", "action.yaml") for p in (root / ".github" / "actions").glob(f"*/{pattern}")}
-    if any(q.is_symlink() for q in [root / ".github", root / ".github" / "workflows", root / ".github" / "actions", root / CONFIG_NAME, *files, *(root / ".github" / "actions").glob("*/action.y*ml")]):
-        print("test-speed: refusing a symlink among the workflows, actions or config: the check reads only files inside the tree", file=sys.stderr)
+    github, workflows, actions_dir = root / ".github", root / ".github" / "workflows", root / ".github" / "actions"
+    files = sorted(p for pattern in ("*.yml", "*.yaml") for p in workflows.glob(pattern))
+    action_dirs = sorted(actions_dir.glob("*")) if actions_dir.is_dir() else []
+    action_files = [q for d in action_dirs for q in (d / "action.yml", d / "action.yaml") if q.exists() or q.is_symlink()]
+    reads = [github, workflows, actions_dir, root / CONFIG_NAME, *files, *action_dirs, *action_files]
+    real_root = os.path.realpath(root)
+    if any(q.is_symlink() or not (os.path.realpath(q) + os.sep).startswith(real_root + os.sep) for q in reads):
+        print("test-speed: refusing a path that is a symlink or resolves outside the checkout (workflows, actions or config): the check reads only files inside the tree", file=sys.stderr)
         return 2
+    actions = {f"./.github/actions/{q.parent.name}": q.read_text() for q in action_files}
     found: list[Finding] = []
     lines: list[str] = []
     found += lint_files({p.relative_to(root).as_posix(): p.read_text() for p in files}, budget, actions)
