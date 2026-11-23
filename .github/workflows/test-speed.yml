@@ -1,4 +1,5 @@
 name: Test speed
+# live proof of the test-speed check on a real pull request (closed unmerged)
 # Copy of miguels8/hermes-home .github/workflows/test-speed.yml; the checker beside it (.github/test-speed/) is byte-identical to hermes-home
 # tools/test_speed_check.py, and tools/ci_speed_alarm.py there alarms when a copy drifts.
 # test-speed-standard-20261122 (Miguel 2026-11-22 22:53 CT: tests last the least time possible, enforced hard). The blocking check `test-speed`:
